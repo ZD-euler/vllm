@@ -367,6 +367,119 @@ class DSAPairedIndexerBlockLayout(DSASharedBlockLayout):
         raise AssertionError(f"Unexpected DSA owner: {owner}")
 
 
+_PACKED_MAIN_BLOCK_SIZE = 128
+_PACKED_MAIN_NOPE_DIM = 512
+_PACKED_MAIN_ROPE_DIM = 64
+_PACKED_MAIN_TILE_SIZE = 128
+_PACKED_MAIN_ROW_BYTES = (
+    _PACKED_MAIN_NOPE_DIM  # INT8
+    + 2 * _PACKED_MAIN_ROPE_DIM  # BF16
+    + 4 * (_PACKED_MAIN_NOPE_DIM // _PACKED_MAIN_TILE_SIZE)  # FP32 scales
+)
+_PACKED_MAIN_PAGE_BYTES = _PACKED_MAIN_BLOCK_SIZE * _PACKED_MAIN_ROW_BYTES
+_PACKED_INDEXER_DIM = 128
+_PACKED_INDEXER_LOGICAL_PAGE_BYTES = (
+    2 * _PACKED_MAIN_BLOCK_SIZE * _PACKED_INDEXER_DIM
+)
+# Each logical indexer page spans two INT8 extents with BF16/FP16 scales.
+_PACKED_INDEXER_SCALE_PAGE_BYTES = 2 * _PACKED_MAIN_BLOCK_SIZE * 2
+
+
+class DSAPackedMainC8PrefillLayout(DSASharedBlockLayout):
+    """Geometry prototype for packed main and C8 indexer in a raw prefill slab.
+
+    The main scale bytes are inline in each packed row. Indexer scales have
+    their own slab. The pool must assign each raw bundle to a single owner.
+    A single raw view replaces the split NOPE and PE planes in this layout.
+    """
+
+    def __post_init__(self) -> None:
+        if type(self.capacity_bundles) is not int or self.capacity_bundles <= 0:
+            raise ValueError("capacity_bundles must be a positive integer")
+        if (
+            self.latent_page_size_bytes != _PACKED_MAIN_PAGE_BYTES
+            or self.indexer_page_size_bytes != _PACKED_INDEXER_LOGICAL_PAGE_BYTES
+            or self.bundle_multiplier != LAYERWISE_PREFILL_BUNDLE_MULTIPLIER
+            or self.k_nope_dim != _PACKED_MAIN_NOPE_DIM
+            or self.k_pe_dim != _PACKED_MAIN_ROPE_DIM
+            or self.indexer_dim != _PACKED_INDEXER_DIM
+            or self.latent_element_size != 1
+            or self.indexer_element_size != 2
+            or self.indexer_scale_page_size_bytes != _PACKED_INDEXER_SCALE_PAGE_BYTES
+            or self.indexer_scale_layer_count != 1
+            or self.paired_indexer_banks
+            or self.backing_alignment_bytes != 0
+        ):
+            raise ValueError("Unsupported packed main C8 prefill geometry")
+
+    @property
+    def latent_dim(self) -> int:
+        return self.k_nope_dim + self.k_pe_dim
+
+    @property
+    def nope_pages_per_bundle(self) -> int:
+        raise ValueError("Packed main C8 requires a single raw slab view")
+
+    @property
+    def pe_pages_per_bundle(self) -> int:
+        raise ValueError("Packed main C8 requires a single raw slab view")
+
+    def block_ids_for_bundle(
+        self, owner: DSASharedBlockOwner, bundle_id: int
+    ) -> tuple[int, ...]:
+        """Return the consecutive logical pages within a real raw bundle."""
+        if type(bundle_id) is not int or not 1 <= bundle_id <= self.capacity_bundles:
+            raise ValueError(f"invalid bundle id {bundle_id}")
+        blocks = self.blocks_per_bundle(owner)
+        start = bundle_id * blocks
+        return tuple(range(start, start + blocks))
+
+    def bundle_id_for_block(
+        self, owner: DSASharedBlockOwner, block_id: int
+    ) -> int:
+        """Map a logical page to its raw bundle, excluding reserved slot zero."""
+        blocks = self.blocks_per_bundle(owner)
+        if type(block_id) is not int or not blocks <= block_id < self.row_count(owner):
+            raise ValueError(f"block id {block_id} is not a real DSA block")
+        return block_id // blocks
+
+
+def dsa_packed_main_c8_prefill_layout(
+    capacity_bundles: int,
+    *,
+    block_size: int,
+    latent_dims: tuple[int, int],
+    indexer_dim: int,
+) -> DSAPackedMainC8PrefillLayout:
+    """Explicitly construct the fixed-format packed main C8 layout prototype.
+
+    The production layout factory does not select this format. Activation
+    requires a runner and connector that implement the packed slab contract.
+    """
+    if (
+        type(block_size) is not int
+        or block_size != _PACKED_MAIN_BLOCK_SIZE
+        or latent_dims != (_PACKED_MAIN_NOPE_DIM, _PACKED_MAIN_ROPE_DIM)
+        or any(type(dim) is not int for dim in latent_dims)
+        or type(indexer_dim) is not int
+        or indexer_dim != _PACKED_INDEXER_DIM
+    ):
+        raise ValueError("Unsupported packed main C8 prefill shape")
+    return DSAPackedMainC8PrefillLayout(
+        latent_page_size_bytes=_PACKED_MAIN_PAGE_BYTES,
+        indexer_page_size_bytes=_PACKED_INDEXER_LOGICAL_PAGE_BYTES,
+        capacity_bundles=capacity_bundles,
+        bundle_multiplier=LAYERWISE_PREFILL_BUNDLE_MULTIPLIER,
+        k_nope_dim=latent_dims[0],
+        k_pe_dim=latent_dims[1],
+        indexer_dim=indexer_dim,
+        latent_element_size=1,
+        indexer_element_size=2,
+        indexer_scale_page_size_bytes=_PACKED_INDEXER_SCALE_PAGE_BYTES,
+        indexer_scale_layer_count=1,
+    )
+
+
 def dsa_shared_block_layout(
     latent_spec: Any,
     indexer_spec: Any,
