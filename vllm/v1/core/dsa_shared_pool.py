@@ -391,11 +391,17 @@ class DSAPackedMainC8PrefillLayout(DSASharedBlockLayout):
     The main scale bytes are inline in each packed row. Indexer scales have
     their own slab. The pool must assign each raw bundle to a single owner.
     A single raw view replaces the split NOPE and PE planes in this layout.
+    Backing alignment reserves space once for the start of the global slab.
     """
 
     def __post_init__(self) -> None:
         if type(self.capacity_bundles) is not int or self.capacity_bundles <= 0:
             raise ValueError("capacity_bundles must be a positive integer")
+        if (
+            type(self.backing_alignment_bytes) is not int
+            or self.backing_alignment_bytes < 0
+        ):
+            raise ValueError("backing alignment must be a nonnegative integer")
         if (
             self.latent_page_size_bytes != _PACKED_MAIN_PAGE_BYTES
             or self.indexer_page_size_bytes != _PACKED_INDEXER_LOGICAL_PAGE_BYTES
@@ -408,7 +414,6 @@ class DSAPackedMainC8PrefillLayout(DSASharedBlockLayout):
             or self.indexer_scale_page_size_bytes != _PACKED_INDEXER_SCALE_PAGE_BYTES
             or self.indexer_scale_layer_count != 1
             or self.paired_indexer_banks
-            or self.backing_alignment_bytes != 0
         ):
             raise ValueError("Unsupported packed main C8 prefill geometry")
 
@@ -423,6 +428,10 @@ class DSAPackedMainC8PrefillLayout(DSASharedBlockLayout):
     @property
     def pe_pages_per_bundle(self) -> int:
         raise ValueError("Packed main C8 requires a single raw slab view")
+
+    def allocation_overhead_bytes(self, latent_layers: int, indexer_layers: int) -> int:
+        """Return the alignment reserve for the single global raw backing."""
+        return self.backing_alignment_bytes
 
     def block_ids_for_bundle(
         self, owner: DSASharedBlockOwner, bundle_id: int
@@ -450,6 +459,7 @@ def dsa_packed_main_c8_prefill_layout(
     block_size: int,
     latent_dims: tuple[int, int],
     indexer_dim: int,
+    backing_alignment_bytes: int = 0,
 ) -> DSAPackedMainC8PrefillLayout:
     """Explicitly construct the fixed-format packed main C8 layout prototype.
 
@@ -477,6 +487,7 @@ def dsa_packed_main_c8_prefill_layout(
         indexer_element_size=2,
         indexer_scale_page_size_bytes=_PACKED_INDEXER_SCALE_PAGE_BYTES,
         indexer_scale_layer_count=1,
+        backing_alignment_bytes=backing_alignment_bytes,
     )
 
 

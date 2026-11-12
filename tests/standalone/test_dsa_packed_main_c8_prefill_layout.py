@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.v1.core.test_prefill_mixed_c8_shared_pool import setup_case, utilities
+
 
 @pytest.fixture(scope="module")
 def api():
@@ -15,10 +17,14 @@ def api():
     return SimpleNamespace(**runpy.run_path(str(path)))
 
 
-@pytest.fixture
-def packed(api):
+@pytest.fixture(params=[0, 2**21], ids=["unaligned", "2mib-backing"])
+def packed(api, request):
     return api.dsa_packed_main_c8_prefill_layout(
-        3, block_size=128, latent_dims=(512, 64), indexer_dim=128
+        3,
+        block_size=128,
+        latent_dims=(512, 64),
+        indexer_dim=128,
+        backing_alignment_bytes=request.param,
     )
 
 
@@ -34,11 +40,43 @@ def test_packed_geometry_and_padding_budget(api, packed):
 
     pool = api.PrefillLayerBundlePool(api.DSASharedBundleAllocator(packed), 4)
     assert isinstance(pool.layout, api.DSAPackedMainC8PrefillLayout)
+    assert pool.layout.backing_alignment_bytes == packed.backing_alignment_bytes
+    assert pool.layout.allocation_overhead_bytes(4, 2) == packed.backing_alignment_bytes
     assert pool.layout.slot_count == 13
     # Include the null bundle and its scale storage in the child slab budget.
     assert pool.layout.slot_count * pool.layout.allocation_bytes_per_bundle(
         1, 1
     ) == 13 * 2728960
+
+
+def test_prefill_sizing_charges_alignment_once(api, packed, monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    monkeypatch.delenv("VLLM_ASCEND_LAYERWISE_PREFILL_NUM_BANKS", raising=False)
+    ns = utilities(api, True)
+    config, groups, _ = setup_case(api, True)
+    # Exercise the existing consumer in isolation with an explicit prototype.
+    ns["dsa_shared_block_layout"] = lambda *_args, **_kwargs: packed
+    payload = 9 * 2728960  # Four banks for each owner, plus slot zero.
+    # Both alignment cases start with the same budget and no block override.
+    # With the reserve charged, only one complete parent fits beside slot zero.
+    natural = ns["get_kv_cache_config_from_groups"](config, groups, payload)
+    expected_parents, expected_slots = (
+        (1, 5) if packed.backing_alignment_bytes else (2, 9)
+    )
+    assert natural.num_blocks == expected_parents
+    assert len(natural.kv_cache_tensors) == 1
+    assert natural.kv_cache_tensors[0].size == expected_slots * 2728960
+
+    budget = payload + packed.backing_alignment_bytes
+    assert ns["_max_memory_usage_bytes_from_groups"](config, groups) == budget
+    result = ns["get_kv_cache_config_from_groups"](config, groups, budget)
+    assert result.num_blocks == 2  # Four child slots per parent.
+    assert len(result.kv_cache_tensors) == 1
+    assert result.kv_cache_tensors[0].size == payload
+
+    config.cache_config.num_gpu_blocks_override = 2
+    with pytest.raises(ValueError, match="exceeds the HBM budget"):
+        ns["get_kv_cache_config_from_groups"](config, groups, budget - 1)
 
 
 def test_banked_allocations_share_capacity(api, packed, monkeypatch):
@@ -108,7 +146,8 @@ def test_unsupported_geometry_is_rejected(api, block_size, latent_dims, indexer_
         )
 
 
-def test_existing_bf16_factory_preserves_prefill_layout(api):
+@pytest.mark.parametrize("alignment", [0, 2**21])
+def test_existing_bf16_factory_preserves_prefill_layout(api, alignment):
     bf16 = SimpleNamespace(itemsize=2)
     int8 = SimpleNamespace(itemsize=1)
     main = SimpleNamespace(
@@ -120,6 +159,7 @@ def test_existing_bf16_factory_preserves_prefill_layout(api):
         dtype=bf16,
         c8_k_cache_dtype=int8,
         indexer_scale_page_size_bytes=256,
+        shared_pool_alignment_bytes=alignment,
     )
     layout = api.dsa_shared_block_layout(main, li, 3, prefill_child=True)
     assert type(layout) is api.DSASharedBlockLayout
@@ -127,6 +167,7 @@ def test_existing_bf16_factory_preserves_prefill_layout(api):
     assert layout.bundle_page_size_bytes == 589824
     assert layout.scale_bytes_per_bundle == 9216
     assert layout.allocation_bytes_per_bundle(1, 1) == 599040
+    assert layout.backing_alignment_bytes == alignment
     assert layout.block_ids_for_bundle(api.DSASharedBlockOwner.LATENT, 1) == tuple(
         range(4, 8)
     )
@@ -140,3 +181,15 @@ def test_existing_bf16_factory_preserves_prefill_layout(api):
     main.dtype = int8
     with pytest.raises(ValueError, match="ratio does not match"):
         api.dsa_shared_block_layout(main, li, 3, prefill_child=True)
+
+
+@pytest.mark.parametrize("alignment", [-1, 1.5, True])
+def test_invalid_backing_alignment_is_rejected(api, alignment):
+    with pytest.raises(ValueError, match="backing alignment must be"):
+        api.dsa_packed_main_c8_prefill_layout(
+            3,
+            block_size=128,
+            latent_dims=(512, 64),
+            indexer_dim=128,
+            backing_alignment_bytes=alignment,
+        )
