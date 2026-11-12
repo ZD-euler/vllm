@@ -463,7 +463,7 @@ def dsa_packed_main_c8_prefill_layout(
 ) -> DSAPackedMainC8PrefillLayout:
     """Explicitly construct the fixed-format packed main C8 layout prototype.
 
-    The production layout factory does not select this format. Activation
+    Homogeneous and mixed C8 indexers share this P-bank geometry. Activation
     requires a runner and connector that implement the packed slab contract.
     """
     if (
@@ -491,6 +491,100 @@ def dsa_packed_main_c8_prefill_layout(
     )
 
 
+def _packed_main_c8_layout_from_specs(
+    latent_spec: Any, indexer_spec: Any, capacity_bundles: int
+) -> DSAPackedMainC8PrefillLayout:
+    import torch
+
+    for spec in (latent_spec, indexer_spec):
+        if (
+            getattr(spec, "page_size_padded", None) is not None
+            or getattr(spec, "indexer_paired_banks", False)
+            or getattr(spec, "dsa_compact_startup_scratch_tokens", 0)
+            or getattr(spec, "dsa_compact_startup_dense_tokens", 0)
+        ):
+            raise ValueError(
+                "Packed main C8 requires unpadded, unpaired prefill specs"
+            )
+
+    if (
+        latent_spec.block_size != _PACKED_MAIN_BLOCK_SIZE
+        or latent_spec.num_kv_heads != 1
+        or latent_spec.head_size != _PACKED_MAIN_ROW_BYTES
+        or latent_spec.dtype != torch.int8
+        or latent_spec.sparse_head_dim != (_PACKED_MAIN_NOPE_DIM, _PACKED_MAIN_ROPE_DIM)
+        or getattr(latent_spec, "cache_sparse_c8", False)
+        or getattr(latent_spec, "indexer_c8_layer_names", None) is not None
+        or getattr(latent_spec, "indexer_scale_layer_count", None) is not None
+        or getattr(latent_spec, "indexer_scale_page_size_bytes", 0)
+        or latent_spec.page_size_bytes != _PACKED_MAIN_PAGE_BYTES
+    ):
+        raise ValueError("Invalid packed main C8 spec")
+
+    # Mixed specs describe the whole logical page with a BF16/FP16 key
+    # extent, while homogeneous C8 specs describe one INT8 key extent.
+    # The global P bank reserves two INT8 extents and their scales either way.
+    c8_owner_names = getattr(indexer_spec, "indexer_c8_layer_names", None)
+    scale_layer_count = getattr(indexer_spec, "indexer_scale_layer_count", None)
+    spec_key_page = _PACKED_INDEXER_LOGICAL_PAGE_BYTES // 2
+    spec_scale_page = _PACKED_INDEXER_SCALE_PAGE_BYTES // 2
+    if c8_owner_names is not None:
+        # The Runner supplies actual owner membership. The layout factory
+        # receives only the spec, so it checks the declaration itself.
+        if (
+            not isinstance(c8_owner_names, tuple)
+            or not c8_owner_names
+            or any(
+                not isinstance(name, str)
+                or not name
+                or any(char.isspace() for char in name)
+                for name in c8_owner_names
+            )
+            or len(set(c8_owner_names)) != len(c8_owner_names)
+            or type(scale_layer_count) is not int
+            or scale_layer_count != len(c8_owner_names)
+        ):
+            raise ValueError("Invalid packed main C8 mixed indexer owner declaration")
+        if getattr(indexer_spec, "shared_indexer_key_dtype", None) != indexer_spec.dtype:
+            raise ValueError("Mixed indexer shared keys must use the logical dtype")
+        spec_key_page = _PACKED_INDEXER_LOGICAL_PAGE_BYTES
+        spec_scale_page = _PACKED_INDEXER_SCALE_PAGE_BYTES
+    elif scale_layer_count is not None:
+        raise ValueError("Homogeneous C8 indexer cannot declare a scale owner count")
+
+    if (
+        indexer_spec.block_size != _PACKED_MAIN_BLOCK_SIZE
+        or indexer_spec.num_kv_heads != 1
+        or indexer_spec.head_size != _PACKED_INDEXER_DIM
+        or indexer_spec.sparse_head_dim != (_PACKED_INDEXER_DIM,)
+        or indexer_spec.dtype not in (torch.bfloat16, torch.float16)
+        or getattr(indexer_spec, "cache_sparse_c8", False) is not True
+        or getattr(indexer_spec, "c8_k_cache_dtype", None) != torch.int8
+        or getattr(indexer_spec, "c8_k_scale_cache_dtype", None) != torch.float16
+        or indexer_spec.indexer_scale_page_size_bytes != spec_scale_page
+        or indexer_spec.page_size_bytes != spec_key_page + spec_scale_page
+    ):
+        raise ValueError("Invalid INT8/FP16 indexer spec for packed main C8")
+
+    alignment = getattr(indexer_spec, "shared_pool_alignment_bytes", 0)
+    latent_alignment = getattr(latent_spec, "shared_pool_alignment_bytes", 0)
+    if (
+        type(alignment) is not int
+        or alignment < 0
+        or type(latent_alignment) is not int
+        or latent_alignment not in (0, alignment)
+    ):
+        raise ValueError("Inconsistent packed main C8 backing alignment declarations")
+
+    return dsa_packed_main_c8_prefill_layout(
+        capacity_bundles,
+        block_size=latent_spec.block_size,
+        latent_dims=latent_spec.sparse_head_dim,
+        indexer_dim=indexer_spec.head_size,
+        backing_alignment_bytes=alignment,
+    )
+
+
 def dsa_shared_block_layout(
     latent_spec: Any,
     indexer_spec: Any,
@@ -498,7 +592,24 @@ def dsa_shared_block_layout(
     *,
     prefill_child: bool = False,
 ) -> DSASharedBlockLayout:
-    """Resolve shared key geometry separately from indexer scale storage."""
+    """Resolve shared key geometry separately from indexer scale storage.
+
+    The packed prototype accepts explicitly marked main specs paired with
+    homogeneous or mixed C8 indexers. The target Runner still requires
+    separate integration before it can allocate packed views.
+    """
+    if getattr(indexer_spec, "cache_sparse_sfa_c8", False) is not False:
+        raise ValueError("Only the main spec may declare packed main C8")
+    packed_main = getattr(latent_spec, "cache_sparse_sfa_c8", False)
+    if packed_main is not False:
+        if packed_main is not True:
+            raise ValueError("Packed main C8 marker must be a boolean")
+        if prefill_child is not True:
+            raise ValueError("Packed main C8 requires a prefill child pool")
+        return _packed_main_c8_layout_from_specs(
+            latent_spec, indexer_spec, capacity_bundles
+        )
+
     scale_bytes = int(getattr(indexer_spec, "indexer_scale_page_size_bytes", 0))
     latent_dims = getattr(latent_spec, "sparse_head_dim", None) or (512, 64)
     indexer_dims = getattr(indexer_spec, "sparse_head_dim", None) or (128,)
